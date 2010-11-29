@@ -22,8 +22,9 @@ no_index:
     - t
     - xt
 requires:
+  DBI: 0
   Try::Tiny: 0
 resources:
   license: http://dev.perl.org/licenses/
   repository: git://github.com/nekokak/p5-Jonk.git
-version: 0.03
+version: 0.04
