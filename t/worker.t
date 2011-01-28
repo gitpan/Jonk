@@ -1,93 +1,221 @@
-use strict;
-use warnings;
 use t::Utils;
 use Test::More;
-use Jonk::Client;
-use Jonk::Worker;
+use Jonk;
 
 my $dbh = t::Utils->setup;
 
-subtest 'worker / flexible job table name' => sub {
-    my $jonk = Jonk::Worker->new($dbh, {functions => [qw/MyWorker/]});
-    is $jonk->{dequeue_query}, q{DELETE FROM job WHERE id = ?};
-    is $jonk->{find_job_query}, q{SELECT * FROM job WHERE func IN ('MyWorker') ORDER BY id LIMIT 50};
-    is $jonk->{lookup_job_query}, q{SELECT * FROM job WHERE id = ?};
+subtest 'find_job' => sub {
+    my $client = Jonk->new($dbh, {functions => [qw/MyWorker/]});
 
-    $jonk = Jonk::Worker->new($dbh, +{functions => [qw/MyWorker MyWorker2/]});
-    is $jonk->{dequeue_query}, q{DELETE FROM job WHERE id = ?};
-    is $jonk->{find_job_query}, q{SELECT * FROM job WHERE func IN ('MyWorker', 'MyWorker2') ORDER BY id LIMIT 50};
-
-    $jonk = Jonk::Worker->new($dbh, +{functions => [qw/MyWorker/], table_name => 'jonk_job'});
-    is $jonk->{dequeue_query}, q{DELETE FROM jonk_job WHERE id = ?};
-    is $jonk->{find_job_query}, q{SELECT * FROM jonk_job WHERE func IN ('MyWorker') ORDER BY id LIMIT 50};
-    is $jonk->{lookup_job_query}, q{SELECT * FROM jonk_job WHERE id = ?};
-
-    done_testing;
-};
-
-subtest 'dequeue' => sub {
-    my $client = Jonk::Client->new($dbh);
-
-    my $job_id = $client->enqueue('MyWorker', 'arg');
+    my $job_id = $client->insert('MyWorker', 'arg');
     ok $job_id;
 
-    my $jonk = Jonk::Worker->new($dbh, {functions => [qw/MyWorker/]});
-    my $job = $jonk->dequeue();
-    is $job->{arg}, 'arg';
-    is $job->{func}, 'MyWorker';
-    ok not $jonk->errstr;
+    my $job = $client->find_job();
+    ok $job;
+    is $job->arg, 'arg';
+    is $job->func, 'MyWorker';
+    is $job->retry_cnt, 0;
+    is $job->run_after, 0;
+    is $job->priority, 0;
 
-    done_testing;
+    ok not $client->errstr;
+
+    $job->completed;
+
+    ok not $client->find_job();
 };
 
-subtest 'dequeue / no job' => sub {
-    my $jonk = Jonk::Worker->new($dbh, {functions => [qw/MyWorker/]});
-    my $job = $jonk->dequeue();
-    ok not $job;
-    done_testing;
+subtest 'find_job / with priority' => sub {
+    my $client = Jonk->new($dbh, {functions => [qw/MyWorker/]});
+
+    $client->insert('MyWorker', 'arg_10', {priority => 10});
+    $client->insert('MyWorker', 'arg_30', {priority => 30});
+    $client->insert('MyWorker', 'arg_20', {priority => 20});
+
+    my $job = $client->find_job();
+    is $job->arg, 'arg_30';
+    is $job->priority, 30;
+
+    ok not $client->errstr;
+
+    $job->completed;
+
+    $job = $client->find_job();
+
+    is $job->arg, 'arg_20';
+    is $job->priority, 20;
+
+    ok not $client->errstr;
+
+    $job->completed;
+
+    $job = $client->find_job();
+
+    is $job->arg, 'arg_10';
+    is $job->priority, 10;
+
+    ok not $client->errstr;
+
+    $job->completed;
 };
 
-subtest 'dequeue / lookup specific job_id' => sub {
-    my $client = Jonk::Client->new($dbh);
+subtest 'find_job / with run_after' => sub {
+    my $client = Jonk->new($dbh, {functions => [qw/MyWorker/]});
 
-    my $job_id = $client->enqueue('MyWorker', 'lookup_job');
+    my $time = time() + 2;
+    $client->insert('MyWorker', 'arg', {run_after => $time});
+
+    ok not $client->find_job();
+
+    sleep 2;
+
+    my $job = $client->find_job();
+    is $job->arg, 'arg';
+    is $job->func, 'MyWorker';
+    is $job->retry_cnt, 0;
+    is $job->run_after, $time;
+    is $job->priority, 0;
+
+    ok not $client->errstr;
+
+    $job->completed;
+
+    ok not $client->find_job();
+};
+
+subtest 'find_job / with grabbed_until' => sub {
+
+    {
+        my $client = Jonk->new($dbh, {functions => [qw/MyWorker/], default_grab_for => 2});
+        $client->insert('MyWorker', 'arg');
+
+        my $job = $client->find_job();
+        is $job->arg, 'arg';
+        is $job->func, 'MyWorker';
+        is $job->retry_cnt, 0;
+        is $job->run_after, 0;
+        is $job->priority, 0;
+
+        ok not $client->errstr;
+
+        ok not $client->find_job();
+
+        sleep 2;
+
+        my $re_grabbed_job = $client->find_job();
+        is $re_grabbed_job->arg, 'arg';
+        is $re_grabbed_job->func, 'MyWorker';
+        is $re_grabbed_job->retry_cnt, 0;
+        is $re_grabbed_job->run_after, 0;
+        is $re_grabbed_job->priority, 0;
+
+        $re_grabbed_job->completed;
+
+        ok not $client->find_job();
+
+        $job->completed;
+    }
+
+    {
+        my $client = Jonk->new($dbh, {functions => ['MyWorker' => {grab_for => 5}], default_grab_for => 2});
+        $client->insert('MyWorker', 'arg');
+
+        my $job = $client->find_job();
+        is $job->arg, 'arg';
+        is $job->func, 'MyWorker';
+        is $job->retry_cnt, 0;
+        is $job->run_after, 0;
+        is $job->priority, 0;
+
+        ok not $client->errstr;
+
+        ok not $client->find_job();
+        sleep 2;
+
+        ok not $client->find_job();
+        sleep 3;
+
+        my $re_grabbed_job = $client->find_job();
+        is $re_grabbed_job->arg, 'arg';
+        is $re_grabbed_job->func, 'MyWorker';
+        is $re_grabbed_job->retry_cnt, 0;
+        is $re_grabbed_job->run_after, 0;
+        is $re_grabbed_job->priority, 0;
+
+        $re_grabbed_job->completed;
+
+        ok not $client->find_job();
+
+        $job->completed;
+    }
+};
+
+subtest 'find_job / without functions' => sub {
+    my $client = Jonk->new($dbh);
+
+    $client->insert('MyWorker', 'arg');
+
+    eval { $client->find_job };
+    like $@, qr/missin find_job functions. at /;
+};
+
+subtest 'lookup_job' => sub {
+    my $client = Jonk->new($dbh, {functions => [qw/MyWorker/]});
+
+    my $job_id = $client->insert('MyWorker', 'arg');
     ok $job_id;
 
-    my $jonk = Jonk::Worker->new($dbh, {functions => [qw/MyWorker/]});
-    my $job = $jonk->dequeue($job_id);
-    is $job->{arg}, 'lookup_job';
-    is $job->{func}, 'MyWorker';
+    my $job = $client->lookup_job($job_id);
+    is $job->func, 'MyWorker';
+    is $job->arg, 'arg';
 
-    done_testing;
-};
+    ok not $client->errstr;
 
-subtest 'error handling' => sub {
-    my $jonk = Jonk::Worker->new($dbh, {table_name => 'jonk_job', functions => [qw/MyWorker/]});
-    my $job = $jonk->dequeue;
+    $job->completed;
 
-    like $jonk->errstr, qr/can't get job from job queue database:/;
-
-    done_testing;
+    ok not $client->lookup_job($job_id);
 };
 
 t::Utils->cleanup($dbh);
 
-
-subtest 'dequeue / flexible job table name' => sub {
+subtest 'find_job / flexible job table name' => sub {
     my $dbh = t::Utils->setup("my_job");
-    my $client = Jonk::Client->new($dbh, { table_name => "my_job" });
+    my $client = Jonk->new($dbh, { table_name => 'my_job', functions => [qw/MyWorker/] });
 
-    my $job_id = $client->enqueue('MyWorker', 'arg');
+    my $job_id = $client->insert('MyWorker', 'arg');
     ok $job_id;
 
-    my $jonk = Jonk::Worker->new($dbh, { table_name => "my_job", functions => [qw/MyWorker/]});
-    my $job = $jonk->dequeue();
-    is $job->{arg}, 'arg';
-    is $job->{func}, 'MyWorker';
-    ok not $jonk->errstr;
+    my $job = $client->find_job();
+    is $job->arg, 'arg';
+    is $job->func, 'MyWorker';
+
+    ok not $client->errstr;
+
+    $job->completed;
+
+    ok not $client->find_job;
 
     t::Utils->cleanup($dbh, "my_job");
-    done_testing;
+};
+
+subtest 'lookup_job / flexible job table name' => sub {
+    my $dbh = t::Utils->setup("my_job");
+    my $client = Jonk->new($dbh, { table_name => 'my_job', functions => [qw/MyWorker/] });
+
+    my $job_id = $client->insert('MyWorker', 'arg');
+    ok $job_id;
+
+    my $job = $client->lookup_job($job_id);
+    is $job->arg, 'arg';
+    is $job->func, 'MyWorker';
+
+    ok not $client->errstr;
+
+    $job->completed;
+
+    ok not $client->lookup_job($job_id);
+
+    t::Utils->cleanup($dbh, "my_job");
 };
 
 done_testing;

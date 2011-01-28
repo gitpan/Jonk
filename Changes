@@ -1,5 +1,16 @@
 Revision history for Perl extension Jonk
 
+0.10_01
+   2011-01-24
+        [ INCOMPATIBLE CHANGE!! ]
+        - many api move to Jonk.
+        - Jonk::Client, Jonk::Worker is removed.
+        - create Jonk::Job.
+
+0.06
+   2010-12-16
+        - FIXED : some pod.
+
 0.05
    2010-12-01
         - FIXED : no use Pod::Simple for testing.
